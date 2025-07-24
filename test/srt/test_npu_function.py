@@ -1,6 +1,6 @@
 import os
-import unittest
 import time
+import unittest
 from types import SimpleNamespace
 
 import requests
@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
 
 class TestNPUDeepseekv3(CustomTestCase):
     model = DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION
@@ -87,7 +88,6 @@ class TestNPUDeepseekv3(CustomTestCase):
         tok = time.perf_counter()
         throuphput = max_tokens / (tok - tic)
         assert throuphput >= 100
-
 
 
 if __name__ == "__main__":

@@ -154,6 +154,7 @@ suites = {
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_awq_dequant.py", 2),
     ],
+<<<<<<< HEAD
     "per-commit-1-ascend-npu": [
         TestFile("test_ascend_tp1_bf16.py", 400),
     ],
@@ -162,6 +163,11 @@ suites = {
     ],
     "per-commit-4-ascend-npu": [
         TestFile("test_ascend_mla_w8a8int8.py", 400),
+=======
+    "per-commit-npu": [
+        TestFile("test_ascend_attention_backend.py", 400),
+        TestFile("test_npu_mla_backend.py", 2000),
+>>>>>>> 7d948c63 ([new feat]: Ascend NPU support deepseek-v3 model)
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),

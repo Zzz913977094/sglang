@@ -2,13 +2,13 @@ name: PR TEST SIMPLE VERSION (NPU)
 
 on:
   push:
-    branches: [ "test_ci" ]
+    branches: [ "main" ]
     path:
       - "python/**"
       - "scripts/**"
       - "test/**"
   pull_request:
-    branches: [ "test_ci" ]
+    branches: [ "main" ]
     paths:
       - "python/**"
       - "scripts/**"

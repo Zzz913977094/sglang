@@ -24,6 +24,7 @@ jobs:
           cp /etc/hosts ./
           sed -i '$a 140.82.112.3                  github/.com' ./hosts
           cp ./hosts /etc/hosts
+          cat /etc/hosts
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install dependencies

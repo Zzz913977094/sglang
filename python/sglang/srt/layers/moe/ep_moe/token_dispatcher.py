@@ -44,7 +44,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -696,21 +696,21 @@ class DeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_mode: ForwardMode = None,
+        forward_batch: ForwardBatch,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl(forward_mode).dispatch_a(
+        inner_state = self._get_impl(forward_batch).dispatch_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
         )
-        self._dispatch_intermediate_state = forward_mode, inner_state
+        self._dispatch_intermediate_state = forward_batch, inner_state
 
     def dispatch_b(self):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
-        forward_mode, inner_state = self._dispatch_intermediate_state
+        forward_batch, inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl(forward_mode).dispatch_b(*inner_state)
+        return self._get_impl(forward_batch).dispatch_b(*inner_state)
 
     def combine(self, *args, **kwargs) -> Tuple:
         self.combine_a(*args, **kwargs)
@@ -722,24 +722,26 @@ class DeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_mode: ForwardMode,
+        forward_batch: ForwardBatch,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl(forward_mode).combine_a(
+        inner_state = self._get_impl(forward_batch).combine_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
         )
-        self._combine_intermediate_state = forward_mode, inner_state
+        self._combine_intermediate_state = forward_batch, inner_state
 
     def combine_b(self):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
-        forward_mode, inner_state = self._combine_intermediate_state
+        forward_batch, inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        return self._get_impl(forward_mode).combine_b(*inner_state)
+        return self._get_impl(forward_batch).combine_b(*inner_state)
 
-    def _get_impl(self, forward_mode: ForwardMode) -> _DeepEPDispatcherImplBase:
-        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+    def _get_impl(self, forward_batch: ForwardBatch) -> _DeepEPDispatcherImplBase:
+        resolved_deepep_mode = self.deepep_mode.resolve(
+            forward_batch.is_extend_in_batch
+        )
         if resolved_deepep_mode == DeepEPMode.normal:
             return self._normal_dispatcher
         elif resolved_deepep_mode == DeepEPMode.low_latency:
@@ -803,11 +805,11 @@ class NpuDeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_mode: ForwardMode,
+        forward_batch: ForwardBatch,
     ) -> Tuple:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         topk_ids = topk_idx.to(torch.int)
-        if forward_mode.is_extend():
+        if forward_batch.is_extend_in_batch:
             return self.dispatch_prefill(hidden_states, topk_ids)
         else:
             return self.dispatch_decode(hidden_states, topk_ids)
@@ -832,7 +834,7 @@ class NpuDeepEPDispatcher:
         dist.all_to_all_single(
             tokens_per_expert_group, tokens_per_expert, group=self.group
         )
-        # combine tensors, do reduceSum and D2H together
+        # combine tensors, do reduceSum and D2H to gather
         combine_tokens = torch.stack(
             [tokens_per_expert_group, tokens_per_expert], dim=0
         )
@@ -918,7 +920,7 @@ class NpuDeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_mode: ForwardMode,
+        forward_batch: ForwardBatch,
         topk_ids: torch.Tensor,
         shared_output: torch.Tensor,
         ep_send_counts,
@@ -926,7 +928,7 @@ class NpuDeepEPDispatcher:
         expanded_x,
         expanded_row_idx,
     ) -> Tuple:
-        if forward_mode.is_extend():
+        if forward_batch.is_extend_in_batch:
             input_splits = ep_send_counts
             output_splits = tp_send_counts
             return self.combine_prefill(

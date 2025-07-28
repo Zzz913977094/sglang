@@ -699,18 +699,25 @@ class GroupCoordinator:
         )
 
         # Serialize object to tensor and get the size as well
-        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8).cuda(
+            device=torch.cuda.current_device()
+        )
 
         size_tensor = torch.tensor(
-            [object_tensor.numel()], dtype=torch.long, device="cpu"
+            [object_tensor.numel()],
+            dtype=torch.long,
+            device=torch.cuda.current_device(),
         )
 
         # Send object size
-
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        torch.distributed.send(
+            size_tensor, dst=self.ranks[dst], group=self.device_group
+        )
 
         # Send object
-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        torch.distributed.send(
+            object_tensor, dst=self.ranks[dst], group=self.device_group
+        )
 
         return None
 
@@ -724,29 +731,31 @@ class GroupCoordinator:
             src != self.rank_in_group
         ), "Invalid source rank. Source rank is the same as the current rank."
 
-        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+        size_tensor = torch.empty(
+            1, dtype=torch.long, device=torch.cuda.current_device()
+        )
 
         # Receive object size
         rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
+            size_tensor, src=self.ranks[src], group=self.device_group
         )
 
         # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
             size_tensor.item(),  # type: ignore[arg-type]
             dtype=torch.uint8,
-            device="cpu",
+            device=torch.cuda.current_device(),
         )
 
         rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
+            object_tensor, src=self.ranks[src], group=self.device_group
         )
 
         assert (
             rank_object == rank_size
         ), "Received object sender rank does not match the size sender rank."
 
-        obj = pickle.loads(object_tensor.numpy().tobytes())
+        obj = pickle.loads(object_tensor.cpu().numpy().tobytes())
 
         return obj
 
@@ -857,14 +866,16 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
-        metadata_list: List[Tuple[Any, Any]] = []
         assert isinstance(
             tensor_dict, dict
         ), f"Expecting a dictionary, got {type(tensor_dict)}"
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        # `metadata_list` lives in CPU memory.
-        # `send_object_list` has serialization & deserialization,
-        # all happening on CPU. Therefore, we can use the CPU group.
+        # Note: While switching to Device-to-Device (D2D) would introduce an extra
+        # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
+        # show better overall transmission performance with D2D due to:
+        # 1. Superior D2D transfer bandwidth
+        # 2. Ability to overlap send and recv operations
+        # Thus the net performance gain justifies this approach.
         self.send_object(metadata_list, dst=dst)
         for tensor in tensor_list:
             if tensor.numel() == 0:
@@ -1054,8 +1065,23 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 
+# duplicate GroupCoordinator for prefill in PD-Multiplexing
+_PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
+
+_ENABLE_PDMUX_P_TP: bool = False
+
+
+def set_pdmux_status(enable_prefill_multiplexing: bool):
+    global _ENABLE_PDMUX_P_TP
+    _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
+
 
 def get_tp_group() -> GroupCoordinator:
+    if _ENABLE_PDMUX_P_TP:
+        assert (
+            _PDMUX_PREFILL_TP_GROUP is not None
+        ), "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+        return _PDMUX_PREFILL_TP_GROUP
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
@@ -1171,6 +1197,7 @@ def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
+    duplicate_tp_group: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1227,6 +1254,23 @@ def initialize_model_parallel(
         ),
         group_name="tp",
     )
+
+    if duplicate_tp_group:
+        global _PDMUX_PREFILL_TP_GROUP
+        assert (
+            _PDMUX_PREFILL_TP_GROUP is None
+        ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
+        _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=get_bool_env_var(
+                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+            ),
+            group_name="pdmux_prefill_tp",
+        )
+        _TP.pynccl_comm.disabled = False
+        _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size

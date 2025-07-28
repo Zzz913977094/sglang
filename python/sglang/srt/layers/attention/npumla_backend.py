@@ -326,7 +326,10 @@ class NpuMLABackend(TorchNativeAttnBackend):
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
             q.dtype
         )
-        if q_rope is None:
+        if q_rope is None or (
+            hasattr(forward_batch.token_to_kv_pool, "enable_kv_cache_seperated")
+            and forward_batch.token_to_kv_pool.enable_kv_cache_seperated
+        ):
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
                 layer.layer_id
             ).to(q.dtype)
@@ -391,11 +394,19 @@ class NpuMLABackend(TorchNativeAttnBackend):
         k: (b*s, N, k_dim=192)
         v: (b*s, N, v_dim=128)
         """
-        if q.ndim == 2:
-            q = q.view(q.shape[0], self.num_local_heads, -1)
-        bs_qlen, q_heads, q_dim = q.size()
-        _, k_heads, k_dim = k.size()
-        _, v_heads, v_dim = v.size()
+        if not isinstance(q, Tuple):
+            if q.ndim == 2:
+                q = q.view(q.shape[0], self.num_local_heads, -1)
+            bs_qlen, q_heads, q_dim = q.size()
+        else:
+            q_heads = self.num_local_heads
+            q_dim = self.qk_rope_head_dim
+        if not isinstance(k, Tuple):
+            _, k_heads, k_dim = k.size()
+        else:
+            k_heads = self.num_local_heads
+            k_dim = self.qk_rope_head_dim
+        bs_qlen, v_heads, v_dim = v.size()
 
         if False:
             attn_weights = (
@@ -437,12 +448,18 @@ class NpuMLABackend(TorchNativeAttnBackend):
                     q_len_offset += q_len
             else:  # MHA
                 if q_dim != v_dim:
-                    q_nope, q_rope = q.split(
-                        [self.v_head_dim, self.qk_rope_head_dim], dim=-1
-                    )
-                    k_nope, k_rope = k.split(
-                        [self.v_head_dim, self.qk_rope_head_dim], dim=-1
-                    )
+                    if isinstance(k, Tuple):
+                        q_nope, q_rope = q
+                    else:
+                        q_nope, q_rope = q.split(
+                            [self.v_head_dim, self.qk_rope_head_dim], dim=-1
+                        )
+                    if isinstance(k, Tuple):
+                        k_nope, k_rope = k
+                    else:
+                        k_nope, k_rope = k.split(
+                            [self.v_head_dim, self.qk_rope_head_dim], dim=-1
+                        )
 
                     attn_ouput, _ = torch.ops.npu.npu_fused_infer_attention_score(
                         q_nope,
@@ -451,12 +468,15 @@ class NpuMLABackend(TorchNativeAttnBackend):
                         query_rope=q_rope,
                         key_rope=k_rope,
                         num_heads=q_heads,
+                        num_key_value_heads=q_heads,
                         input_layout="TND",
                         atten_mask=self.attn_mask,
                         sparse_mode=3,
                         actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
                         actual_seq_lengths_kv=self.forward_metadata.seq_lens_list_cumsum,
                         scale=layer.scaling,
+                        antiquant_mode=0,
+                        antiquant_scale=None,
                         next_tokens=0,
                     )
                 else:
@@ -494,8 +514,12 @@ class NpuMLABackend(TorchNativeAttnBackend):
             # k_nope, k_rope = k_cache.split(
             #     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             # )  # todo, there is a bug
-            k_nope = k_cache[..., : self.kv_lora_rank]
-            k_rope = k_cache[..., self.kv_lora_rank :]
+            if not forward_batch.token_to_kv_pool.enable_kv_cache_seperated:
+                k_nope = k_cache[..., : q_nope.size(-1)]
+                k_rope = k_cache[..., q_nope.size(-1) :]
+            else:
+                k_nope = k_cache
+                k_rope = v_cache.view(-1, PAGE_SIZE, v_cache.size(-1))
 
             attn_ouput, _ = torch.ops.npu.npu_fused_infer_attention_score(
                 q_nope,

@@ -16,6 +16,7 @@
 from enum import Enum
 from typing import Optional
 
+import torch
 from torch import nn
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -88,7 +89,7 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        if k is not None:
+        if k is not None and isinstance(k, torch.Tensor):
             # For cross-layer sharing, kv can be None
             assert v is not None
             if "k_rope" not in kwargs:

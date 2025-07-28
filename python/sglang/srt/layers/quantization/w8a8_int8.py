@@ -235,7 +235,11 @@ class W8A8Int8Config(QuantizationConfig):
                         proj_name, self.packed_modules_mapping[proj_name][0]
                     )
                 self.is_dynamic = (
-                    self.quant_description[prefix_in_quant_config + ".weight"]
+                    "quant_method" in self.quant_description
+                    and self.quant_description["quant_method"] == "compressed-tensors"
+                ) or (
+                    f"{prefix_in_quant_config}.weight" in self.quant_description
+                    and self.quant_description[prefix_in_quant_config + ".weight"]
                     == "W8A8_DYNAMIC"
                 )
                 if self.is_layer_skipped(prefix, self.packed_modules_mapping):
@@ -273,7 +277,8 @@ class W8A8Int8Config(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 is_shard_skipped = (
-                    self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                    f"{shard_prefix}.weight" in self.quant_description
+                    and self.quant_description[shard_prefix + ".weight"] == "FLOAT"
                 )
 
                 if is_skipped is None:
@@ -285,7 +290,10 @@ class W8A8Int8Config(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
+            is_skipped = (
+                f"{prefix}.weight" in self.quant_description
+                and self.quant_description[prefix + ".weight"] == "FLOAT"
+            )
 
         assert is_skipped is not None
         return is_skipped

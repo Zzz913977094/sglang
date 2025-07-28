@@ -1078,6 +1078,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
 
+        if _is_npu:
+            self.npu_use_fused_op = True
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -1360,7 +1363,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_a_layernorm.weight,
             cos,
             sin,
-            forward_batch.out_cache_loc,
+            forward_batch.out_cache_loc.to(torch.int64),
             value_cache.view(block_num, block_size, 1, -1),
             key_cache.view(block_num, block_size, 1, -1),
             k_rope_scale=None,
@@ -1539,7 +1542,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_a_layernorm.weight,
             cos,
             sin,
-            tmp_slot_mapping,
+            tmp_slot_mapping.to(torch.int64),
             rope_cache.view(block_num, block_size, 1, -1),
             nope_cache.view(block_num, block_size, 1, -1),
             epsilon=self.kv_a_layernorm.variance_epsilon,

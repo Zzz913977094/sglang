@@ -41,18 +41,15 @@ MAX_SEQ_LEN = 4096
 @dataclass
 class NpuMLADecodeMetadata:
     npumla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    num_splits: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
 
     def __init__(
         self,
         npumla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        num_splits: Optional[torch.Tensor] = None,
         block_kv_indices: Optional[torch.Tensor] = None,
         seq_lens_list=None,
     ):
         self.npumla_metadata = npumla_metadata
-        self.num_splits = num_splits
         self.block_kv_indices = block_kv_indices
         self.seq_lens_list = seq_lens_list if seq_lens_list is not None else [1]
         self.seq_lens_list_cumsum = np.cumsum(self.seq_lens_list).tolist()
@@ -216,13 +213,11 @@ class NpuMLABackend(TorchNativeAttnBackend):
             )
             self.forward_metadata = NpuMLADecodeMetadata(
                 None,
-                None,
                 block_kv_indices,
                 forward_batch.seq_lens_cpu.tolist(),
             )
         else:
             self.forward_metadata = NpuMLADecodeMetadata(
-                None,
                 None,
                 None,
                 forward_batch.extend_seq_lens_cpu,
@@ -247,7 +242,6 @@ class NpuMLABackend(TorchNativeAttnBackend):
     ):
         max_seqlen_pad = (num_tokens // bs + PAGE_SIZE - 1) // PAGE_SIZE
         self.forward_metadata = NpuMLADecodeMetadata(
-            None,
             None,
             torch.full(
                 (bs, max_seqlen_pad),
@@ -390,12 +384,12 @@ class NpuMLABackend(TorchNativeAttnBackend):
         _, v_heads, v_dim = v.size()
 
         if use_gqa:
-            attn_ouput = torch.empty(
+            attn_output = torch.empty(
                 bs_qlen, q_heads, v_dim, device=q.device, dtype=q.dtype
             )
             q_len_offset = 0
             for q_len in forward_batch.seq_len:
-                attn_ouput[q_len_offset : q_len_offset + q_len] = (
+                attn_output[q_len_offset : q_len_offset + q_len] = (
                     torch.ops.npu.npu_fused_infer_attention_score(
                         q[None, q_len_offset : q_len_offset + q_len],
                         k[None, q_len_offset : q_len_offset + q_len],
@@ -419,7 +413,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
                     [self.v_head_dim, self.qk_rope_head_dim], dim=-1
                 )
 
-                attn_ouput, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q_nope,
                     k_nope,
                     v,
@@ -435,7 +429,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
                     next_tokens=0,
                 )
             else:
-                attn_ouput, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q,
                     k,
                     v,
@@ -448,9 +442,9 @@ class NpuMLABackend(TorchNativeAttnBackend):
                     scale=layer.scaling,
                     next_tokens=0,
                 )
-            attn_ouput = attn_ouput[..., : layer.v_head_dim]
+            attn_output = attn_output[..., : layer.v_head_dim]
 
-        return attn_ouput.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _run_npu_forward_decode(self, q, k_cache, v_cache, layer, forward_batch):
         """
@@ -469,7 +463,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
             k_nope = k_cache[..., : self.kv_lora_rank]
             k_rope = k_cache[..., self.kv_lora_rank :]
 
-            attn_ouput, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                 q_nope,
                 k_nope,
                 k_nope,
@@ -490,8 +484,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
                 actual_seq_lengths_kv=self.forward_metadata.seq_lens_list,
             )
         else:  # MHA
-            seq_len_kv = forward_batch.seq_lens
-            attn_ouput, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                 q_nope,
                 k_cache.view(-1, PAGE_SIZE, k_heads * k_dim),
                 v_cache.view(-1, PAGE_SIZE, k_heads * k_dim),
@@ -504,64 +497,5 @@ class NpuMLABackend(TorchNativeAttnBackend):
                 actual_seq_lengths_kv=self.forward_metadata.seq_lens_list,
                 scale=layer.scaling,
             )
-        attn_ouput = attn_ouput.view(b * s, layer.tp_q_head_num, layer.v_head_dim)
-        # attn_ouput = q.new_zeros((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
-        return attn_ouput
-
-
-# TODO: multi step kv indices optimization
-class NpuMLAMultiStepDraftBackend:
-    """
-    Wrap multiple npumla attention backends as one for multiple consecutive
-    draft decoding steps.
-    """
-
-    def __init__(
-        self,
-        model_runner: ModelRunner,
-        topk: int,
-        speculative_num_steps: int,
-    ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
-
-        if topk > 1:
-            raise ValueError(
-                f"Currently NpuMLA only supports topk=1 for speculative decoding"
-            )
-        self.topk = topk
-        self.speculative_num_steps = speculative_num_steps
-        max_bs = model_runner.req_to_token_pool.size * self.topk
-        self.kv_indptr = torch.zeros(
-            (
-                self.speculative_num_steps,
-                max_bs + 1,
-            ),
-            dtype=torch.int32,
-            device=model_runner.device,
-        )
-
-        self.attn_backends = []
-        for i in range(self.speculative_num_steps):
-            self.attn_backends.append(
-                NpuMLABackend(
-                    model_runner,
-                    skip_prefill=True,
-                )
-            )
-
-    def common_template(
-        self,
-        forward_batch: ForwardBatch,
-        call_fn: Callable,
-    ):
-        assert forward_batch.spec_info is not None
-
-        for i in range(self.speculative_num_steps - 1):
-            call_fn(i, forward_batch)
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        def call_fn(i, forward_batch):
-            assert forward_batch.spec_info is not None
-            self.attn_backends[i].init_forward_metadata(forward_batch)
-
-        self.common_template(forward_batch, call_fn)
+        attn_output = attn_output.view(b * s, layer.tp_q_head_num, layer.v_head_dim)
+        return attn_output

@@ -60,7 +60,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, NpuDeepEPMoE, get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import (
+    DeepEPMoE,
+    NpuDeepEPMoE,
+    get_moe_impl_class,
+)
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization import deep_gemm_wrapper
@@ -639,15 +643,6 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         pad_size = None
         forward_mode = forward_batch.forward_mode
-        if forward_mode.is_extend():
-            pad_size = (
-                forward_batch.seq_lens_sum // get_attention_tp_size() + 1
-            ) - hidden_states.size(0)
-        else:
-            pad_size = (
-                forward_batch.batch_size // get_attention_tp_size() + 1
-            ) - hidden_states.size(0)
-        hidden_states = F.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
         shared_output = None
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
             # router_logits: (num_tokens, n_experts)
@@ -662,11 +657,17 @@ class DeepseekV2MoE(nn.Module):
                 ),
             )
         else:
-            topk_idx = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            topk_idx = torch.randint(
+                low=0,
+                high=256,
+                size=(hidden_states.size(0), self.top_k),
+                dtype=torch.int,
+                device=hidden_states.device,
             )
             topk_weights = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+                (hidden_states.size(0), self.top_k),
+                dtype=torch.float32,
+                device=hidden_states.device,
             )
 
         expert_tokens = None
@@ -709,9 +710,6 @@ class DeepseekV2MoE(nn.Module):
                 expanded_x=expanded_x,
                 expanded_row_idx=expanded_row_idx,
             )
-
-        if pad_size > 0:
-            final_hidden_states = final_hidden_states[:-pad_size, :]
 
         return final_hidden_states
 
